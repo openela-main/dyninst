@@ -2,32 +2,35 @@ Summary: An API for Run-time Code Generation
 License: LGPLv2+
 Name: dyninst
 Group: Development/Libraries
-Release: 2%{?dist}
+Release: 1%{?dist}
 URL: http://www.dyninst.org
-Version: 10.1.0
+Version: 12.1.0
 ExclusiveArch: %{ix86} x86_64 ppc64le aarch64
 
+%define __testsuite_version 12.1.0
 Source0: https://github.com/dyninst/dyninst/archive/v%{version}/dyninst-%{version}.tar.gz
-Source1: https://github.com/dyninst/testsuite/archive/v%{version}/testsuite-%{version}.tar.gz
+Source1: https://github.com/dyninst/testsuite/archive/%{__testsuite_version}/testsuite-%{__testsuite_version}.tar.gz
 
-Patch1: dyninst-10.1.0-tbb.patch
-Patch2: dyninst-10.1.0-result.patch
-Patch3: testsuite-10.1.0-386.patch
+Patch1: dyninst-12.1.0-dwarf.patch
+Patch2: dyninst-12.1.0-tbb.patch
 
 %global dyninst_base dyninst-%{version}
-%global testsuite_base testsuite-%{version}
+%global testsuite_base testsuite-%{__testsuite_version}
 
 BuildRequires: gcc-c++
 BuildRequires: elfutils-devel
 BuildRequires: elfutils-libelf-devel
+BuildRequires: elfutils-debuginfod-client-devel
 BuildRequires: boost-devel
 BuildRequires: binutils-devel
 BuildRequires: cmake
 BuildRequires: libtirpc-devel
 BuildRequires: tbb tbb-devel
+BuildRequires: tex-latex
+BuildRequires: make
 
 # Extra requires just for the testsuite
-BuildRequires: gcc-gfortran glibc-static libstdc++-static nasm libxml2-devel
+BuildRequires: gcc-gfortran glibc-static libstdc++-static libxml2-devel
 
 # Testsuite files should not provide/require anything
 %{?filter_setup:
@@ -78,7 +81,6 @@ Group: Development/System
 Requires: dyninst = %{version}-%{release}
 Requires: dyninst-devel = %{version}-%{release}
 Requires: dyninst-static = %{version}-%{release}
-Requires: glibc-static
 %description testsuite
 dyninst-testsuite includes the test harness and target programs for
 making sure that dyninst works properly.
@@ -87,9 +89,13 @@ making sure that dyninst works properly.
 %setup -q -n %{name}-%{version} -c
 %setup -q -T -D -a 1
 
-%patch1 -p1 -b.tbb
-%patch2 -p1 -b.result
-%patch3 -p1 -b.386
+pushd %{testsuite_base}
+popd
+
+pushd %{dyninst_base}
+%patch1 -p1 -b .dwarf
+%patch2 -p1 -b .tbb
+popd
 
 # cotire seems to cause non-deterministic gcc errors
 # https://bugzilla.redhat.com/show_bug.cgi?id=1420551
@@ -100,46 +106,65 @@ sed -i.cotire -e 's/USE_COTIRE true/USE_COTIRE false/' \
 
 cd %{dyninst_base}
 
+CFLAGS="$CFLAGS $RPM_OPT_FLAGS"
+LDFLAGS="$LDFLAGS $RPM_LD_FLAGS"
+%ifarch %{ix86}
+    CFLAGS="$CFLAGS -fno-lto -march=i686"
+    LDFLAGS="$LDFLAGS -fno-lto"
+%endif    
+CXXFLAGS="$CFLAGS"
+export CFLAGS CXXFLAGS LDFLAGS
+
 %cmake \
  -DENABLE_STATIC_LIBS=1 \
+ -DENABLE_DEBUGINFOD=1 \
  -DINSTALL_LIB_DIR:PATH=%{_libdir}/dyninst \
  -DINSTALL_INCLUDE_DIR:PATH=%{_includedir}/dyninst \
  -DINSTALL_CMAKE_DIR:PATH=%{_libdir}/cmake/Dyninst \
  -DCMAKE_BUILD_TYPE=None \
  -DCMAKE_SKIP_RPATH:BOOL=YES \
  .
-%make_build
+%cmake_build
 
 # Hack to install dyninst nearby, so the testsuite can use it
-make DESTDIR=../install install
+DESTDIR="../install" %__cmake --install "%{__cmake_builddir}"
 find ../install -name '*.cmake' -execdir \
-  sed -i -e 's!%{_prefix}!../install&!' '{}' '+'
+  sed -i -e "s!%{_prefix}!$PWD/../install&!" '{}' '+'
 # cmake mistakenly looks for libtbb.so in the dyninst install dir
 sed -i '/libtbb.so/ s/".*usr/"\/usr/' $PWD/../install%{_libdir}/cmake/Dyninst/commonTargets.cmake
 
 cd ../%{testsuite_base}
+# testsuite build sometimes encounters dependency issues with -jN
+%define _smp_mflags -j1
 %cmake \
  -DDyninst_DIR:PATH=$PWD/../install%{_libdir}/cmake/Dyninst \
  -DINSTALL_DIR:PATH=%{_libdir}/dyninst/testsuite \
  -DCMAKE_BUILD_TYPE:STRING=Debug \
  -DCMAKE_SKIP_RPATH:BOOL=YES \
  .
-%make_build
+%cmake_build
 
 %install
 
 cd %{dyninst_base}
-%make_install
+%cmake_install
 
 # It doesn't install docs the way we want, so remove them.
 # We'll just grab the pdfs later, directly from the build dir.
 rm -v %{buildroot}%{_docdir}/*-%{version}.pdf
 
 cd ../%{testsuite_base}
-%make_install
+%cmake_install
 
 mkdir -p %{buildroot}/etc/ld.so.conf.d
 echo "%{_libdir}/dyninst" > %{buildroot}/etc/ld.so.conf.d/%{name}-%{_arch}.conf
+
+# Ugly hack to mask testsuite files from debuginfo extraction.  Running the
+# testsuite requires debuginfo, so extraction is useless.  However, debuginfo
+# extraction is still nice for the main libraries, so we don't want to disable
+# it package-wide.  The permissions are restored by attr(755,-,-) in files.
+find %{buildroot}%{_libdir}/dyninst/testsuite/ \
+  -type f '!' -name '*.a' -execdir chmod 644 '{}' '+'
 
 %post -p /sbin/ldconfig
 %postun -p /sbin/ldconfig
@@ -176,17 +201,36 @@ echo "%{_libdir}/dyninst" > %{buildroot}/etc/ld.so.conf.d/%{name}-%{_arch}.conf
 
 %files testsuite
 %{_bindir}/parseThat
-%exclude %{_bindir}/cfg_to_dot
-%exclude /usr/bin/codeCoverage
-%exclude /usr/bin/unstrip
-%exclude /usr/bin/ddb.db
-%exclude /usr/bin/params.db
-%exclude /usr/bin/unistd.db
 %dir %{_libdir}/dyninst/testsuite/
 %attr(755,root,root) %{_libdir}/dyninst/testsuite/*[!a]
 %attr(644,root,root) %{_libdir}/dyninst/testsuite/*.a
 
 %changelog
+* Thu Apr 21 2022 Stan Cox <scox@redhat.com> - 12.1.0-1
+- Update to 12.1.0
+
+* Wed Jun 30 2021 Stan Cox <scox@redhat.com> - 11.0.0-3
+- Related: rhbz1965455
+
+* Mon Jun 28 2021 Stan Cox <scox@redhat.com> - 11.0.0-2
+- Related: rhbz1965455, rhbz1965501
+
+* Fri Apr 30 2021 Stan Cox <scox@redhat.com> - 11.0.0-1
+- Update to 11.0.0
+
+* Fri Nov 06 2020 Stan Cox <scox@redhat.com> - 10.2.1-2
+- Enable debuginfod
+
+* Wed Oct 28 2020 Stan Cox <scox@redhat.com> - 10.2.1-1
+- Update to 10.2.1
+
+* Tue Nov 19 2019 Stan Cox <scox@redhat.com> - 10.1.0-4
+- Resolves: rhbz#963475 dyninst must be ported to aarch64
+  Remove Requires: glibc-static from %package testsuite
+
+* Fri Nov 15 2019 Stan Cox <scox@redhat.com> - 10.1.0-3
+- Fix rhbz963475 dyninst must be ported to aarch64 
+
 * Tue Jun 04 2019 Stan Cox <scox@redhat.com> - 10.1.0-2
 - Use PRIx64 to fix i386 build
 
